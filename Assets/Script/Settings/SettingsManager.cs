@@ -55,6 +55,7 @@ namespace YARG.Settings
                 nameof(Settings.FpsStats),
                 nameof(Settings.ShowActivePlayers),
                 nameof(Settings.ShowActiveBots),
+                nameof(Settings.ShowAudioDiagnosticsPanel),
 
                 new HeaderMetadata("Other"),
                 nameof(Settings.ReconnectProfiles),
@@ -97,6 +98,18 @@ namespace YARG.Settings
                 new HeaderMetadata("Customization"),
                 nameof(Settings.EnablePlaybackBuffer),
                 nameof(Settings.PlaybackBufferLength),
+
+                new HeaderMetadata("Output"),
+#if UNITY_STANDALONE_WIN
+                new ButtonRowMetadata(nameof(Settings.ListWasapiDevices), nameof(Settings.ListAsioDevices)),
+#endif
+                new ButtonRowMetadata(nameof(Settings.LogAudioDiagnostics), nameof(Settings.SaveAudioDiagnostics)),
+                nameof(Settings.OutputBackend),
+                nameof(Settings.AudioSampleRate),
+                nameof(Settings.AudioBufferSize),
+                nameof(Settings.OutputDeviceIndex),
+                nameof(Settings.OutputChannels),
+                nameof(Settings.OutputRouting),
 
                 new HeaderMetadata("Input"),
                 nameof(Settings.MicrophoneSensitivity),

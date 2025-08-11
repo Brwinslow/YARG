@@ -651,10 +651,14 @@
             "CopyCurrentSongTextFilePath": "Copy Current Song Text File Path",
             "ExportSongsOuvert": "Export Songs List (For Ouvert Bot)",
             "ExportSongsText": "Export Songs List (Plain Text)",
+            "ListAsioDevices": "List ASIO Devices",
+            "ListWasapiDevices": "List WASAPI Devices",
+            "LogAudioDiagnostics": "Log Audio Diagnostics",
             "OpenCalibrator": "Open Calibrator",
             "OpenVenueFolder": "Open Backgrounds/Venue Folder",
             "AddFolder": "Add Folder",
             "RefreshCache": "Scan Songs",
+            "SaveAudioDiagnostics": "Save Audio Diagnostics",
             "OpenExecutablePath": "Open Executable Path",
             "OpenPersistentDataPath": "Open Persistent Data Path"
         },
@@ -1124,6 +1128,42 @@
                 "Name": "Playback Buffer Length",
                 "Description": "The size of the playback buffer, in milliseconds. Larger buffers provide more stability, but further increase the latency of sound effects."
             },
+            "OutputBackend": {
+                "Name": "Audio Output Backend",
+                "Description": "Select the audio output method. Auto tries the best available backend for your platform, then falls back to default.",
+                "Dropdown": {
+                    "Auto": "Auto",
+                    "WasapiShared": "WASAPI Shared",
+                    "WasapiExclusive": "WASAPI Exclusive",
+                    "Asio": "ASIO",
+                    "DefaultDevice": "Default Device"
+                }
+            },
+            "OutputChannels": {
+                "Name": "Output Channels",
+                "Description": "Number of output channels to use (2=stereo, 4=quad, 6=5.1). The device must support the selected channel count."
+            },
+            "OutputDeviceIndex": {
+                "Name": "Output Device Index",
+                "Description": "Index of the output device to use for the selected backend (-1 uses system default). Use the 'List Devices' buttons to see available devices."
+            },
+            "OutputRouting": {
+                "Name": "Output Routing",
+                "Description": "How to route audio stems to output channels in multi-channel setups.",
+                "Dropdown": {
+                    "Stereo": "Stereo",
+                    "Quad": "Quad",
+                    "SixChannel": "5.1 Surround"
+                }
+            },
+            "AudioSampleRate": {
+                "Name": "Sample Rate",
+                "Description": "Audio sample rate in Hz. Higher rates provide better quality but use more CPU. 44100 Hz is CD quality, 48000 Hz is professional standard."
+            },
+            "AudioBufferSize": {
+                "Name": "Buffer Size",
+                "Description": "Audio buffer size in samples. Lower values reduce latency but may cause dropouts if too low. Higher values increase latency but improve stability."
+            },
             "ShowTime": {
                 "Name": "Show Time",
                 "Description": "Show current time on Status Bar."
@@ -1144,6 +1184,10 @@
                 "Name": "Show Active Bots",
                 "Description": "Show the number of active bot profiles on the Status Bar (if any)."
             },
+            "ShowAudioDiagnosticsPanel": {
+                "Name": "Show Audio Diagnostics Panel",
+                "Description": "Display a real-time panel showing current audio backend, device name, format, and latency information."
+            },
             "DMXUniverseChannel": {
                 "Name": "DMX Broadcast Universe",
                 "Description": "This is the universe that YARG will send the sACN packet to. Default is \"1\". Maximum is \"65535\"."
@@ -1163,6 +1207,14 @@
             "WaitForSongVideo": {
                 "Name": "Wait For Song Videos When Seeking",
                 "Description": "Waits for a song-specific video background to finish seeking when restarting/changing sections in practice or seeking a replay."
+            },
+            "WasapiBufferMs": {
+                "Name": "WASAPI Buffer (ms)",
+                "Description": "Buffer size in milliseconds for WASAPI audio backends. Lower values reduce latency but may cause audio dropouts if too low."
+            },
+            "WasapiPeriodMs": {
+                "Name": "WASAPI Period (ms)",
+                "Description": "Period size in milliseconds for WASAPI audio backends. Should be smaller than buffer size. Lower values reduce latency."
             },
             "WrapAroundNavigation": {
                 "Name": "Wrap-Around Navigation",

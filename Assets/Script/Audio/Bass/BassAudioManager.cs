@@ -8,6 +8,8 @@ using UnityEngine;
 using YARG.Core.Audio;
 using YARG.Core.Logging;
 using YARG.Settings;
+using YARG.Audio.BASS.Output;
+using YARG.Audio.BASS.OutputEngines;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -87,6 +89,16 @@ namespace YARG.Audio.BASS
 
     public class BassAudioManager : AudioManager
     {
+        private IAudioOutputEngine _engine; // null unless decoding backend is used
+        internal int MasterOutputMixer { get; private set; } // decoding master mixer for WASAPI/ASIO
+        private int _sfxMixer; // decoding mixer for SFX/DrumSFX
+        private bool _useDecodingBackend;
+
+        // Re-initialization fields
+        private bool _reinitializationRequested;
+        private string _reinitializationReason;
+        private readonly object _reinitLock = new object();
+
         private static readonly string[] FORMATS =
         {
             ".ogg", ".mogg", ".wav", ".mp3", ".aiff", ".opus",
@@ -133,33 +145,10 @@ namespace YARG.Audio.BASS
             // Disable undocumented BASS_CONFIG_DEV_TIMEOUT config. Prevents pausing audio output if a device times out.
             Bass.Configure((Configuration) 70, false);
 
-            int deviceCount = Bass.DeviceCount;
-            YargLogger.LogFormatInfo("Devices found: {0}", deviceCount);
-
-            if (!Bass.Init(-1, 44100, DeviceInitFlags.Default | DeviceInitFlags.Latency, IntPtr.Zero))
-            {
-                var error = Bass.LastError;
-                if (error == Errors.Already)
-                    YargLogger.LogError("BASS is already initialized! An error has occurred somewhere and Unity must be restarted!");
-                else
-                    YargLogger.LogFormatError("Failed to initialize BASS: {0}!", error);
-                return;
-            }
-
-            LoadSfx();
-            LoadDrumSfx(); // TODO: move drum sfx loading/disposal to song start/end respectively IF there are any drum players
-
-            var info = Bass.Info;
-            PlaybackLatency = info.Latency + Bass.DeviceBufferLength + devPeriod;
-            MinimumBufferLength = info.MinBufferLength + Bass.UpdatePeriod;
-            MaximumBufferLength = 5000;
-
-            YargLogger.LogInfo("BASS Successfully Initialized");
-            YargLogger.LogFormatInfo("BASS: {0} - BASS.FX: {1} - BASS.Mix: {2}", Bass.Version, BassFx.Version, BassMix.Version);
-            YargLogger.LogFormatInfo("Update Period: {0}ms. Device Buffer Length: {1}ms. Playback Buffer Length: {2}ms. Device Playback Latency: {3}ms",
-                Bass.UpdatePeriod, Bass.DeviceBufferLength, Bass.PlaybackBufferLength, PlaybackLatency);
-            YargLogger.LogFormatInfo("Current Device: {0}", Bass.GetDeviceInfo(Bass.CurrentDevice).Name);
+            // Initialize audio backends with current settings
+            InitializeAudioBackends();
         }
+
 
 #nullable enable
         protected override StemMixer? CreateMixer(string name, float speed, double mixerVolume, bool clampStemVolume)
@@ -169,11 +158,18 @@ namespace YARG.Audio.BASS
                 YargLogger.LogDebug("Loading song");
             }
 
-            if (!CreateMixerHandle(out int handle))
+            if (_useDecodingBackend)
             {
-                return null;
+                return new BassDecodingStemMixer(name, this, speed, mixerVolume, 0, clampStemVolume);
             }
-            return new BassStemMixer(name, this, speed, mixerVolume, handle, 0, clampStemVolume);
+            else
+            {
+                if (!CreateMixerHandle(out int handle))
+                {
+                    return null;
+                }
+                return new BassStemMixer(name, this, speed, mixerVolume, handle, 0, clampStemVolume);
+            }
         }
 
         protected override StemMixer? CreateMixer(string name, Stream stream, float speed, double mixerVolume, bool clampStemVolume)
@@ -183,16 +179,26 @@ namespace YARG.Audio.BASS
                 YargLogger.LogDebug("Loading song");
             }
 
-            if (!CreateMixerHandle(out int handle))
+            if (_useDecodingBackend)
             {
-                return null;
+                if (!CreateSourceStream(stream, out int sourceStream))
+                {
+                    return null;
+                }
+                return new BassDecodingStemMixer(name, this, speed, mixerVolume, sourceStream, clampStemVolume);
             }
-
-            if (!CreateSourceStream(stream, out int sourceStream))
+            else
             {
-                return null;
+                if (!CreateMixerHandle(out int handle))
+                {
+                    return null;
+                }
+                if (!CreateSourceStream(stream, out int sourceStream))
+                {
+                    return null;
+                }
+                return new BassStemMixer(name, this, speed, mixerVolume, handle, sourceStream, clampStemVolume);
             }
-            return new BassStemMixer(name, this, speed, mixerVolume, handle, sourceStream, clampStemVolume);
         }
 
         protected override MicDevice? GetInputDevice(string name)
@@ -275,7 +281,7 @@ namespace YARG.Audio.BASS
                     if (File.Exists(sfxPath))
                     {
                         var sfxSample = AudioHelpers.GetSfxFromName(sfxFile);
-                        var sfx = BassSampleChannel.Create(sfxSample, sfxPath, 8);
+                        var sfx = _useDecodingBackend ? (SampleChannel) new BassSampleChannelDecoding(sfxSample, sfxPath, GetSfxMixerHandle(), AudioHelpers.SfxVolume[(int) sfxSample]) : BassSampleChannel.Create(sfxSample, sfxPath, 8);
                         if (sfx != null)
                         {
                             SfxSamples[(int) sfxSample] = sfx;
@@ -304,7 +310,7 @@ namespace YARG.Audio.BASS
                     if (File.Exists(sfxPath))
                     {
                         var sfxSample = AudioHelpers.GetDrumSfxFromName(sfxFile);
-                        var sfx = BassDrumSampleChannel.Create(sfxSample, sfxPath, 8);
+                        var sfx = _useDecodingBackend ? (DrumSampleChannel) new BassDrumSampleChannelDecoding(sfxSample, sfxPath, GetSfxMixerHandle()) : BassDrumSampleChannel.Create(sfxSample, sfxPath, 8);
                         if (sfx != null)
                         {
                             DrumSfxSamples[(int) sfxSample] = sfx;
@@ -323,8 +329,24 @@ namespace YARG.Audio.BASS
             if (EditorUtility.audioMasterMute)
                 volume = 0;
 #endif
-            Bass.GlobalStreamVolume = (int) (10_000 * volume);
-            Bass.GlobalSampleVolume = (int) (10_000 * volume);
+            SetMasterVolumeInternal(volume);
+        }
+
+        /// <summary>
+        /// Thread-safe version of SetMasterVolume that doesn't access Unity Editor APIs
+        /// Used during audio re-initialization from background threads
+        /// </summary>
+        private void SetMasterVolumeInternal(double volume)
+        {
+            if (_useDecodingBackend)
+            {
+                Bass.ChannelSetAttribute(MasterOutputMixer, ChannelAttribute.Volume, volume);
+            }
+            else
+            {
+                Bass.GlobalStreamVolume = (int) (10_000 * volume);
+                Bass.GlobalSampleVolume = (int) (10_000 * volume);
+            }
         }
 
         protected override void ToggleBuffer_Internal(bool enable)
@@ -337,9 +359,331 @@ namespace YARG.Audio.BASS
             Bass.PlaybackBufferLength = length;
         }
 
+        private int GetSfxMixerHandle()
+        {
+            return _useDecodingBackend ? _sfxMixer : 0;
+        }
+
+        public void RequestAudioReinitialize(string reason)
+        {
+            lock (_reinitLock)
+            {
+                if (_reinitializationRequested)
+                {
+                    YargLogger.LogInfo($"Audio re-initialization already requested. Previous reason: {_reinitializationReason}, New reason: {reason}");
+                    return;
+                }
+
+                _reinitializationRequested = true;
+                _reinitializationReason = reason;
+                
+                YargLogger.LogFormatInfo("Requesting audio re-initialization: {0}", reason);
+                
+                // Start the re-initialization process on a background thread to avoid blocking the main thread
+                var reinitTask = new System.Threading.Tasks.Task(PerformReinitializationAsync);
+                reinitTask.Start();
+            }
+        }
+
+        private void PerformReinitializationAsync()
+        {
+            try
+            {
+                YargLogger.LogFormatInfo("Starting audio re-initialization: {0}", _reinitializationReason);
+
+                // Step 1: Fade out current audio smoothly
+                FadeOutCurrentAudio();
+
+                // Step 2: Stop and dispose current engines/mixers
+                CleanupCurrentAudioResources();
+
+                // Step 3: Re-initialize with new settings
+                ReinitializeAudioWithNewSettings();
+
+                // Step 4: Fade back in
+                FadeInNewAudio();
+
+                YargLogger.LogInfo("Audio re-initialization completed successfully");
+            }
+            catch (System.Exception ex)
+            {
+                YargLogger.LogFormatError("Audio re-initialization failed: {0}", ex);
+                
+                // Try to fallback to a safe state
+                try
+                {
+                    CleanupCurrentAudioResources();
+                    // Re-run basic initialization as fallback
+                    ReinitializeAudioWithNewSettings();
+                }
+                catch (System.Exception fallbackEx)
+                {
+                    YargLogger.LogFormatError("Audio re-initialization fallback also failed: {0}", fallbackEx);
+                }
+            }
+            finally
+            {
+                lock (_reinitLock)
+                {
+                    _reinitializationRequested = false;
+                    _reinitializationReason = null;
+                }
+            }
+        }
+
+        private void FadeOutCurrentAudio()
+        {
+            const int fadeDurationMs = 500; // 500ms fade out
+            const int fadeSteps = 20;
+            const int stepDelayMs = fadeDurationMs / fadeSteps;
+
+            YargLogger.LogInfo("Fading out audio for re-initialization...");
+
+            double originalVolume = SettingsManager.Settings.MasterMusicVolume?.Value ?? 0.75;
+            
+            for (int step = fadeSteps; step >= 0; step--)
+            {
+                double fadeVolume = originalVolume * (step / (double)fadeSteps);
+                SetMasterVolumeInternal(fadeVolume);
+                System.Threading.Thread.Sleep(stepDelayMs);
+            }
+            
+            // Mute completely
+            SetMasterVolumeInternal(0.0);
+        }
+
+        private void FadeInNewAudio()
+        {
+            const int fadeDurationMs = 300; // 300ms fade in (shorter than fade out)
+            const int fadeSteps = 15;
+            const int stepDelayMs = fadeDurationMs / fadeSteps;
+
+            YargLogger.LogInfo("Fading in audio after re-initialization...");
+
+            double targetVolume = SettingsManager.Settings.MasterMusicVolume?.Value ?? 0.75;
+            
+            for (int step = 0; step <= fadeSteps; step++)
+            {
+                double fadeVolume = targetVolume * (step / (double)fadeSteps);
+                SetMasterVolumeInternal(fadeVolume);
+                System.Threading.Thread.Sleep(stepDelayMs);
+            }
+        }
+
+        private void CleanupCurrentAudioResources()
+        {
+            YargLogger.LogInfo("Cleaning up current audio resources...");
+            
+            // Stop and dispose current engine
+            _engine?.Stop();
+            _engine?.Dispose();
+            _engine = null;
+
+            // Clean up mixers
+            if (MasterOutputMixer != 0)
+            {
+                Bass.StreamFree(MasterOutputMixer);
+                MasterOutputMixer = 0;
+            }
+            
+            if (_sfxMixer != 0)
+            {
+                Bass.StreamFree(_sfxMixer);
+                _sfxMixer = 0;
+            }
+
+            _useDecodingBackend = false;
+
+            // Free BASS but keep plugins loaded
+            Bass.Free();
+        }
+
+        private void ReinitializeAudioWithNewSettings()
+        {
+            YargLogger.LogInfo("Re-initializing audio with new settings...");
+            
+            // Re-run the initialization logic from constructor
+            Bass.Configure(Configuration.IncludeDefaultDevice, true);
+            Bass.UpdatePeriod = 5;
+            Bass.DeviceNonStop = true;
+            Bass.AsyncFileBufferLength = 65536;
+
+            int devPeriod = Bass.GetConfig(Configuration.DevicePeriod);
+            Bass.DeviceBufferLength = 2 * devPeriod;
+
+            // Reconfigure all the settings
+            Bass.UnicodeDeviceInformation = true;
+            Bass.FloatingPointDSP = true;
+            Bass.VistaTruePlayPosition = false;
+            Bass.UpdateThreads = GlobalAudioHandler.MAX_THREADS;
+
+            Bass.Configure((Configuration) 68, 1);
+            Bass.Configure((Configuration) 70, false);
+
+            // Re-run backend selection with current settings
+            InitializeAudioBackends();
+
+            // Reload SFX if needed
+            if (!_useDecodingBackend)
+            {
+                LoadSfx();
+                LoadDrumSfx();
+            }
+        }
+
+        private void InitializeAudioBackends()
+        {
+            // Get universal audio settings
+            var desiredBackend = AudioBackend.Auto;
+            int desiredDevice = -1;
+            int desiredChannels = 2;
+            int desiredSampleRate = 44100;
+            int desiredBufferSize = 512;
+            try
+            {
+                desiredBackend = SettingsManager.Settings.OutputBackend?.Value ?? AudioBackend.Auto;
+                desiredDevice = SettingsManager.Settings.OutputDeviceIndex?.Value ?? -1;
+                desiredChannels = SettingsManager.Settings.OutputChannels?.Value ?? 2;
+                desiredSampleRate = SettingsManager.Settings.AudioSampleRate?.Value ?? 44100;
+                desiredBufferSize = SettingsManager.Settings.AudioBufferSize?.Value ?? 512;
+            }
+            catch { }
+
+#if UNITY_STANDALONE_WIN
+            if (desiredBackend == AudioBackend.Auto || desiredBackend == AudioBackend.Asio)
+            {
+                var asio = new AsioOutputEngine();
+                if (asio.Init(desiredDevice, desiredSampleRate, desiredChannels, desiredBufferSize))
+                {
+                    _engine = asio;
+                }
+            }
+            if (_engine == null && (desiredBackend == AudioBackend.Auto || desiredBackend == AudioBackend.WasapiExclusive))
+            {
+                var wasapiEx = new WasapiOutputEngine(exclusive: true);
+                if (wasapiEx.Init(desiredDevice, desiredSampleRate, desiredChannels, desiredBufferSize))
+                {
+                    _engine = wasapiEx;
+                }
+            }
+            if (_engine == null && (desiredBackend == AudioBackend.Auto || desiredBackend == AudioBackend.WasapiShared))
+            {
+                var wasapi = new WasapiOutputEngine(exclusive: false);
+                if (wasapi.Init(desiredDevice, desiredSampleRate, desiredChannels, desiredBufferSize))
+                {
+                    _engine = wasapi;
+                }
+            }
+#endif
+
+            // Use DefaultBassOutputEngine for explicit DefaultDevice selection only
+            // On non-Windows platforms, Auto should fall through to regular BASS initialization  
+            if (_engine == null && desiredBackend == AudioBackend.DefaultDevice)
+            {
+                var defaultEngine = new DefaultBassOutputEngine();
+                if (defaultEngine.Init(desiredDevice, desiredSampleRate, desiredChannels, desiredBufferSize))
+                {
+                    _engine = defaultEngine;
+                }
+            }
+
+            if (_engine != null)
+            {
+                _useDecodingBackend = true;
+                MasterOutputMixer = BassMix.CreateMixerStream(desiredSampleRate, desiredChannels, BassFlags.Float | BassFlags.Decode);
+                if (MasterOutputMixer == 0)
+                {
+                    YargLogger.LogFormatError("Failed to create master decoding mixer: {0}!", Bass.LastError);
+                    _useDecodingBackend = false;
+                    _engine?.Dispose();
+                    _engine = null;
+                }
+                else
+                {
+                    // Create SFX mixer for decoding backends (always stereo)
+                    _sfxMixer = BassMix.CreateMixerStream(desiredSampleRate, 2, BassFlags.Float | BassFlags.Decode);
+                    if (_sfxMixer != 0)
+                    {
+                        var flags = desiredChannels > 2 ? BassFlags.MixerChanMatrix : BassFlags.Default;
+                        if (!BassMix.MixerAddChannel(MasterOutputMixer, _sfxMixer, flags))
+                        {
+                            YargLogger.LogFormatError("Failed to add SFX mixer to master: {0}!", Bass.LastError);
+                        }
+                        else if (flags.HasFlag(BassFlags.MixerChanMatrix))
+                        {
+                            float[,] mat = new float[desiredChannels, 2];
+                            mat[0,0] = 1f; mat[1,1] = 1f;
+                            BassMix.ChannelSetMatrix(_sfxMixer, mat);
+                        }
+                    }
+
+                    if (!_engine.Start(MasterOutputMixer))
+                    {
+                        YargLogger.LogError("Failed to start selected audio backend. Falling back to default device.");
+                        _useDecodingBackend = false;
+                        _engine?.Dispose();
+                        _engine = null;
+                    }
+                }
+            }
+
+            if (!_useDecodingBackend)
+            {
+                // Fall back to default BASS initialization
+                // Configure buffer size for platforms that support it (Linux, Android, Windows CE)
+                int bufferMs = YARG.Settings.SettingsManager.SettingContainer.BufferSizeToMilliseconds(desiredBufferSize, desiredSampleRate);
+                Bass.DeviceBufferLength = bufferMs;
+                
+                YargLogger.LogFormatInfo("Falling back to regular BASS playback: {0}Hz, {1}ch, {2} samples buffer ({3}ms)",
+                    desiredSampleRate, desiredChannels, desiredBufferSize, bufferMs);
+                
+                int deviceCount = Bass.DeviceCount;
+                YargLogger.LogFormatInfo("Devices found: {0}", deviceCount);
+
+                if (!Bass.Init(-1, desiredSampleRate, DeviceInitFlags.Default | DeviceInitFlags.Latency, IntPtr.Zero))
+                {
+                    var error = Bass.LastError;
+                    if (error == Errors.Already)
+                    {
+                        YargLogger.LogWarning("BASS is already initialized - attempting to free and retry");
+                        Bass.Free();
+                        // Retry initialization after freeing
+                        if (!Bass.Init(-1, desiredSampleRate, DeviceInitFlags.Default | DeviceInitFlags.Latency, IntPtr.Zero))
+                        {
+                            YargLogger.LogFormatError("Failed to initialize BASS after retry: {0}!", Bass.LastError);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        YargLogger.LogFormatError("Failed to initialize BASS: {0}!", error);
+                        return;
+                    }
+                }
+
+                int devPeriod = Bass.GetConfig(Configuration.DevicePeriod);
+                var info = Bass.Info;
+                PlaybackLatency = info.Latency + Bass.DeviceBufferLength + devPeriod;
+                MinimumBufferLength = info.MinBufferLength + Bass.UpdatePeriod;
+                MaximumBufferLength = 5000;
+
+                YargLogger.LogInfo("BASS Successfully Initialized");
+                YargLogger.LogFormatInfo("BASS: {0} - BASS.FX: {1} - BASS.Mix: {2}", Bass.Version, BassFx.Version, BassMix.Version);
+                YargLogger.LogFormatInfo("Update Period: {0}ms. Device Buffer Length: {1}ms. Playback Buffer Length: {2}ms. Device Playback Latency: {3}ms",
+                    Bass.UpdatePeriod, Bass.DeviceBufferLength, Bass.PlaybackBufferLength, PlaybackLatency);
+                if (!_useDecodingBackend)
+                {
+                    YargLogger.LogFormatInfo("Current Device: {0}", Bass.GetDeviceInfo(Bass.CurrentDevice).Name);
+                }
+            }
+        }
+
         protected override void DisposeUnmanagedResources()
         {
             YargLogger.LogInfo("Unloading BASS plugins");
+            _engine?.Dispose();
+            if (MasterOutputMixer != 0) { Bass.StreamFree(MasterOutputMixer); MasterOutputMixer = 0; }
+            if (_sfxMixer != 0) { Bass.StreamFree(_sfxMixer); _sfxMixer = 0; }
             Bass.PluginFree(0);
             Bass.Free();
         }

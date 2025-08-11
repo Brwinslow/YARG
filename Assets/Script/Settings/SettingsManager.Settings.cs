@@ -4,6 +4,7 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 using YARG.Core.Audio;
 using YARG.Core.Engine;
+using YARG.Audio.BASS.Output;
 using YARG.Core.Logging;
 using YARG.Gameplay;
 using YARG.Gameplay.HUD;
@@ -133,6 +134,65 @@ namespace YARG.Settings
 
             public VolumeSetting MasterMusicVolume { get; } = new(0.75f, v => GlobalAudioHandler.SetMasterVolume(v));
 
+            // Audio Output Backend selection (Windows-only backends are conditionally used)
+            public YARG.Settings.Types.DropdownSetting<AudioBackend> OutputBackend { get; } = new(AudioBackend.Auto, OnAudioBackendChanged)
+            {
+                AudioBackend.Auto,
+#if UNITY_STANDALONE_WIN
+                AudioBackend.WasapiShared,
+                AudioBackend.WasapiExclusive,
+                AudioBackend.Asio,
+#endif
+                AudioBackend.DefaultDevice
+            };
+
+            // Backend device index (per-backend interpretation). -1 uses the system default
+            public IntSetting OutputDeviceIndex { get; } = new(-1, -1, 128, OnAudioDeviceChanged);
+
+            // Number of output channels on the selected device/mode (2,4,6). Engines will attempt this, falling back if unsupported
+            public IntSetting OutputChannels { get; } = new(2, 2, 8, OnAudioChannelsChanged);
+
+            public enum RoutingPreset
+            {
+                Stereo,
+                Quad,
+                SixChannel
+            }
+
+            public DropdownSetting<RoutingPreset> OutputRouting { get; } = new(RoutingPreset.Stereo)
+            {
+                RoutingPreset.Stereo,
+                RoutingPreset.Quad,
+                RoutingPreset.SixChannel
+            };
+
+            // Universal audio quality settings (cross-platform)
+            public DropdownSetting<int> AudioSampleRate { get; } = new(44100, OnAudioSampleRateChanged)
+            {
+                44100,
+                48000,
+                88200,
+                96000
+            };
+
+            public DropdownSetting<int> AudioBufferSize { get; } = new(512, OnAudioBufferSizeChanged)
+            {
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048
+            };
+
+            // WASAPI timing parameters in MILLISECONDS (converted to seconds when passed to BASS WASAPI)
+            // Only used in WASAPI engines on Windows
+#if UNITY_STANDALONE_WIN
+            public IntSetting WasapiBufferMs { get; } = new(20, 5, 200, OnWasapiBufferChanged);
+            public IntSetting WasapiPeriodMs { get; } = new(5, 2, 50, OnWasapiBufferChanged);
+#endif
+
+
             public VolumeSetting GuitarVolume { get; } =
                 new(1f, v => GlobalAudioHandler.SetVolumeSetting(SongStem.Guitar, v));
 
@@ -189,6 +249,14 @@ namespace YARG.Settings
                 AudioFxMode.On
             };
 
+            // Debug helpers
+#if UNITY_STANDALONE_WIN
+            public void ListWasapiDevices() => YARG.Audio.BASS.DeviceLogger.LogWasapiDevices();
+            public void ListAsioDevices() => YARG.Audio.BASS.DeviceLogger.LogAsioDevices();
+#endif
+            public void LogAudioDiagnostics() => YARG.Audio.BASS.DeviceLogger.LogAudioDiagnostics();
+            public void SaveAudioDiagnostics() => YARG.Audio.BASS.DeviceLogger.SaveAudioDiagnostics();
+
             public ToggleSetting ClapsInStarpower { get; } = new(true);
 
             public ToggleSetting OverstrumAndOverhitSoundEffects { get; } = new(true);
@@ -203,6 +271,8 @@ namespace YARG.Settings
             public ToggleSetting UseChipmunkSpeed { get; } = new(false, UseChipmunkSpeedChange);
 
             public ToggleSetting ApplyVolumesInMusicLibrary { get; } = new(true);
+
+            public ToggleSetting ShowAudioDiagnosticsPanel { get; } = new(false, ShowAudioDiagnosticsPanelCallback);
 
             #endregion
 
@@ -485,6 +555,12 @@ namespace YARG.Settings
                 StatsManager.Instance.SetShowing(StatsManager.Stat.ActiveBots, value);
             }
 
+            private static void ShowAudioDiagnosticsPanelCallback(bool value)
+            {
+                // The AudioDiagnosticsHUD handles its own visibility through the setting subscription
+                // This callback is mainly for consistency with other HUD elements
+            }
+
             private static void RB3EEnabledCallback(bool value)
             {
                 RB3EHardware.Instance.HandleEnabledChanged(value);
@@ -619,6 +695,69 @@ namespace YARG.Settings
                     YargLogger.LogFormatInfo("Description for device {0}:\n{1}\n", device.displayName,
                         item2: device.description.ToJson());
                 }
+            }
+
+            private static void OnAudioBackendChanged(AudioBackend backend)
+            {
+                RequestAudioReinitialize("Output Backend changed");
+            }
+
+            private static void OnAudioDeviceChanged(int deviceIndex)
+            {
+                RequestAudioReinitialize("Output Device changed");
+            }
+
+            private static void OnAudioChannelsChanged(int channels)
+            {
+                RequestAudioReinitialize("Output Channels changed");
+            }
+
+            private static void OnAudioSampleRateChanged(int sampleRate)
+            {
+                RequestAudioReinitialize("Sample Rate changed");
+            }
+
+            private static void OnAudioBufferSizeChanged(int bufferSize)
+            {
+                RequestAudioReinitialize("Buffer Size changed");
+            }
+
+            // Utility function to convert buffer size (samples) to milliseconds
+            public static int BufferSizeToMilliseconds(int bufferSizeFrames, int sampleRate)
+            {
+                return (bufferSizeFrames * 1000) / sampleRate;
+            }
+
+            // Utility function to convert buffer size (milliseconds) to samples  
+            public static int BufferSizeToFrames(int bufferMs, int sampleRate)
+            {
+                return (bufferMs * sampleRate) / 1000;
+            }
+
+#if UNITY_STANDALONE_WIN
+            private static void OnWasapiBufferChanged(int bufferMs)
+            {
+                RequestAudioReinitialize("WASAPI Buffer settings changed");
+            }
+#endif
+
+            private static void RequestAudioReinitialize(string reason)
+            {
+                // Schedule audio re-initialization on the main thread
+                UnityEngine.Debug.Log($"[AudioManager] {reason} - scheduling re-initialization");
+                
+                // Use UnityMainThreadCallback to ensure we're on the main thread
+                UnityMainThreadCallback.QueueEvent(() =>
+                {
+                    try
+                    {
+                        GlobalAudioHandler.RequestAudioReinitialize(reason);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        UnityEngine.Debug.LogError($"[AudioManager] Failed to request re-initialization: {ex.Message}");
+                    }
+                });
             }
             #endregion
         }
